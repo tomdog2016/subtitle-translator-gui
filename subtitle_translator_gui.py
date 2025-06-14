@@ -7,12 +7,16 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QTextEdit, QComboBox, 
     QStatusBar, QToolBar, QMessageBox, QSplitter, QFrame,
-    QDialog, QDialogButtonBox, QLineEdit, QSpinBox, QStyle)
+    QDialog, QDialogButtonBox, QLineEdit, QSpinBox, QInputDialog, QStyle)
 from PyQt6.QtCore import Qt, QSize, QSettings, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QAction
 import re
 import json
 import requests
+import shutil
+import subprocess
+import tempfile
+import shlex
 from typing import List, Dict, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -243,6 +247,13 @@ class SubtitleTranslator(QMainWindow):
         self.setWindowIcon(QIcon("icons/app.png"))
         self.setGeometry(100, 100, 1200, 800)
         
+        # 检测 ffmpeg 可用性
+        ffmpeg_path = r"D:\software\ffmpeg\bin\ffmpeg.exe"
+        self.ffmpeg_available = os.path.exists(ffmpeg_path)
+        if not self.ffmpeg_available:
+            self._log_error(f"未在 {ffmpeg_path} 找到 ffmpeg，可执行字幕提取将不可用")
+        else:
+            self.ffmpeg_path = ffmpeg_path  # 保存完整路径
         # 初始化日志系统
         self._setup_logging()
         
@@ -671,38 +682,175 @@ class SubtitleTranslator(QMainWindow):
         main_layout.addWidget(bottom_bar)
         
     def open_file(self):
+        # 使用 QFileDialog 打开文件，支持字幕和视频
+
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "打开字幕文件",
             "",
-            "字幕文件 (*.srt *.ass *.ssa);;所有文件 (*.*)"
+            "字幕/视频文件 (*.srt *.ass *.ssa *.mkv *.mp4);;所有文件 (*.*)"
         )
         
         if file_path:
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                    self.original_text.setPlainText(content)
-                    self.status_bar.showMessage(f"已加载: {file_path}")
-                    # 记录并保存当前文件路径
-                    self.current_file_path = file_path
-                    self._log_info(f"已加载文件: {file_path}")
-            except Exception as e:
-                QMessageBox.critical(self, "错误", f"无法打开文件: {str(e)}")
+            # 判断是否为视频，通过扩展名
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext in [".mkv", ".mp4"]:
+                if not self.ffmpeg_available:
+                    QMessageBox.critical(self, "错误", "未检测到 ffmpeg，无法提取视频字幕")
+                    return
+                success, content = self._extract_subtitle_from_video(file_path)
+                if not success:
+                    QMessageBox.critical(self, "错误", content)
+                    return
+            else:
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                except Exception as e:
+                    QMessageBox.critical(self, "错误", f"无法打开文件: {str(e)}")
+                    return
+                    
+            # 更新UI
+            self.original_text.setPlainText(content)
+            self.status_bar.showMessage(f"已加载: {file_path}")
+            # 记录并保存当前文件路径
+            self.current_file_path = file_path
+            self._log_info(f"已加载文件: {file_path}")
+            
     
+    def _extract_subtitle_from_video(self, video_path: str):
+        """使用 ffmpeg 解析字幕流并提取文本轨道，返回 (success, content or error)"""
+        try:
+            # 使用完整路径调用 ffmpeg 解析轨道
+            cmd = [self.ffmpeg_path, "-i", video_path]
+            proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            _, err = proc.communicate()
+            # 提取含 "Subtitle:" 且包含可识别格式
+            tracks = []
+            stream_pattern = re.compile(r"Stream #\d:(\d+)(?:\((.*?)\))?: Subtitle: (\w+)")
+            for line in err.splitlines():
+                m = stream_pattern.search(line)
+                if m:
+                    idx, lang, fmt = m.group(1), m.group(2) or 'und', m.group(3).lower()
+                    if fmt in ["ass", "ssa", "subrip", "srt"]:
+                        if fmt == "subrip":
+                            fmt = "srt"
+                        tracks.append((idx, lang, fmt, line.strip()))
+            if not tracks:
+                return False, "视频中未找到文本字幕轨道 (ass/srt)"
+            # 让用户选择轨道
+            choices = [f"#{idx} {lang} [{fmt}]" for idx, lang, fmt, _ in tracks]
+            selected, ok = QInputDialog.getItem(self, "选择字幕轨道", "请选择要提取的字幕流：", choices, 0, False)
+            if not ok:
+                return False, "用户取消选择"
+            sel_idx = choices.index(selected)
+            stream_idx, lang, fmt, _ = tracks[sel_idx]
+            # 提取到临时文件
+            suffix = ".ass" if fmt == "ass" else ".srt"
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+            os.close(tmp_fd)
+            
+            # 构建提取命令 - 使用正确的流选择语法
+            extract_cmd = [
+                self.ffmpeg_path,
+                "-y",  # 覆盖输出文件
+                "-i", video_path,
+                "-map", f"0:{stream_idx}",  # 使用绝对流索引
+                "-c:s", "copy",  # 直接复制字幕流，不重新编码
+                "-f", "ass" if fmt == "ass" else "srt",  # 强制指定输出格式
+                "-loglevel", "warning",  # 减少日志输出
+                tmp_path
+            ]
+            
+            self._log_info(f"执行提取命令: {' '.join(extract_cmd)}")
+            
+            try:
+                # 运行提取命令，设置超时30秒
+                extract = subprocess.run(
+                    extract_cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=30
+                )
+                
+                # 记录完整的错误输出以便调试
+                if extract.stderr:
+                    self._log_error(f"FFmpeg 错误输出: {extract.stderr}")
+                
+                if extract.returncode != 0:
+                    error_msg = f"提取字幕失败 (返回码 {extract.returncode}): {extract.stderr[:200]}"
+                    self._log_error(error_msg)
+                    return False, error_msg
+                
+                # 读取提取的字幕内容
+                with open(tmp_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                
+                if not content.strip():
+                    return False, "提取的字幕文件为空"
+                
+                self._log_info(f"成功提取 {len(content)} 字符的字幕内容")
+                return True, content
+                
+            except subprocess.TimeoutExpired:
+                error_msg = "提取字幕超时，请重试"
+                self._log_error(error_msg)
+                return False, error_msg
+                
+            except Exception as e:
+                error_msg = f"提取字幕时发生错误: {str(e)}"
+                self._log_error(error_msg)
+                return False, error_msg
+                
+            finally:
+                # 确保删除临时文件
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception as e:
+                    self._log_error(f"删除临时文件失败: {str(e)}")
+        except Exception as e:
+            return False, f"解析字幕失败: {str(e)}"
+
     def save_file(self):
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "保存翻译文件",
-            "",
-            "字幕文件 (*.srt *.ass);;所有文件 (*.*)"
-        )
+        if not hasattr(self, 'current_file_path') or not self.current_file_path:
+            # 如果没有当前文件路径，使用默认的保存对话框
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "保存翻译文件",
+                "",
+                "字幕文件 (*.srt *.ass);;所有文件 (*.*)"
+            )
+        else:
+            # 从当前文件路径生成新的文件名
+            base_path, ext = os.path.splitext(self.current_file_path)
+            
+            # 如果是从视频文件提取的字幕，使用视频文件名
+            if self.current_file_path.lower().endswith(('.mkv', '.mp4')):
+                # 如果已经有_cn后缀，不再添加
+                if not base_path.lower().endswith('_cn'):
+                    base_path += '_cn'
+                # 使用.ass作为默认扩展名
+                default_path = base_path + '.ass'
+            else:
+                # 普通字幕文件，添加_cn
+                default_path = base_path + '_cn' + ext
+            
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "保存翻译文件",
+                default_path,
+                "字幕文件 (*.srt *.ass);;所有文件 (*.*)"
+            )
         
         if file_path:
             try:
                 with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(self.translated_text.toPlainText())
-                    self.status_bar.showMessage(f"已保存到: {file_path}")
+                self.status_bar.showMessage(f"已保存到: {file_path}")
+                self._log_info(f"已保存翻译文件: {file_path}")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"保存文件失败: {str(e)}")
     
